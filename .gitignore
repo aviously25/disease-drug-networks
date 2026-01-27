@@ -1,0 +1,5 @@
+data
+.venv
+.claude
+.DS_Store
+lib
