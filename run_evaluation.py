@@ -104,21 +104,20 @@ eb = [(xv2[i],yv2[i]) for i in range(len(hop1)) if not (rv2[i] in ('contraindica
 G_B = nx.Graph(); G_B.add_edges_from(eb)
 print(f"  Graph B: {G_B.number_of_nodes():,} nodes, {G_B.number_of_edges():,} edges ({time.time()-t2:.1f}s)")
 
-# DisGeNET integration for Graph C
-print("\n  Loading DisGeNET for Graph C...")
-import requests, gzip, io
-DISGENET_PATH = "data/disgenet_curated.tsv"
+# DISEASES database (Jensen Lab) integration for Graph C
+# Replaces DisGeNET which now requires authentication
+print("\n  Loading DISEASES database for Graph C...")
+import requests
+DISGENET_PATH = "data/diseases_knowledge.tsv"
 disgenet_edges_added = 0
 
 if not os.path.exists(DISGENET_PATH):
-    print("  Downloading DisGeNET...")
+    print("  Downloading DISEASES database (Jensen Lab)...")
     try:
-        resp = requests.get("https://www.disgenet.org/static/disgenet_ap1/files/downloads/curated_gene_disease_associations.tsv.gz", timeout=60)
+        resp = requests.get("https://download.jensenlab.org/human_disease_knowledge_filtered.tsv", timeout=60)
         resp.raise_for_status()
-        with gzip.open(io.BytesIO(resp.content), 'rt') as gz:
-            content = gz.read()
-        with open(DISGENET_PATH, 'w') as f:
-            f.write(content)
+        with open(DISGENET_PATH, 'w', encoding='utf-8') as f:
+            f.write(resp.text)
         print(f"  Saved to {DISGENET_PATH}")
     except Exception as e:
         print(f"  Download failed: {e}")
@@ -128,36 +127,33 @@ else:
 
 G_C = G_B.copy()
 if DISGENET_PATH and os.path.exists(DISGENET_PATH):
-    dgn = pd.read_csv(DISGENET_PATH, sep='\t', low_memory=False)
+    # DISEASES db has no header; cols: protein_id, gene_name, disease_id, disease_name, source, type, score
+    dgn = pd.read_csv(DISGENET_PATH, sep='\t', header=None, low_memory=False,
+                      names=['protein_id', 'gene_name', 'disease_id', 'disease_name', 'source', 'type', 'score'])
     primekg_disease_names = {}
     for nid, nname in zip(df[df['x_type']=='disease']['x_id'].astype(str), df[df['x_type']=='disease']['x_name'].str.lower().str.strip()):
         primekg_disease_names[nname] = nid
     for nid, nname in zip(df[df['y_type']=='disease']['y_id'].astype(str), df[df['y_type']=='disease']['y_name'].str.lower().str.strip()):
         primekg_disease_names[nname] = nid
-    primekg_gene_ids = {}
-    for gid in df[df['x_type']=='gene/protein']['x_id'].unique():
-        primekg_gene_ids[str(int(gid))] = str(gid)
-    for gid in df[df['y_type']=='gene/protein']['y_id'].unique():
-        primekg_gene_ids[str(int(gid))] = str(gid)
-    dn_col = 'diseaseName' if 'diseaseName' in dgn.columns else ('disease_name' if 'disease_name' in dgn.columns else None)
-    gi_col = 'geneId' if 'geneId' in dgn.columns else ('gene_id' if 'gene_id' in dgn.columns else None)
-    if dn_col and gi_col:
-        existing = set(G_B.edges())
-        dnames = dgn[dn_col].astype(str).str.lower().str.strip().values
-        gids = dgn[gi_col].values
-        new_e = []
-        for i in range(len(dgn)):
-            try:
-                gid = str(int(gids[i]))
-            except: continue
-            did = primekg_disease_names.get(dnames[i])
-            pgid = primekg_gene_ids.get(gid)
-            if did and pgid and (did,pgid) not in existing and (pgid,did) not in existing:
-                new_e.append((did, pgid))
-                existing.add((did, pgid))
-        G_C.add_edges_from(new_e)
-        disgenet_edges_added = len(new_e)
-        print(f"  DisGeNET edges added: {disgenet_edges_added:,}")
+    # Map gene symbol (lowercase) -> PrimeKG node ID
+    primekg_gene_names = {}
+    for gname, gid in zip(df[df['x_type']=='gene/protein']['x_name'].str.lower().str.strip(), df[df['x_type']=='gene/protein']['x_id'].astype(str)):
+        primekg_gene_names[gname] = gid
+    for gname, gid in zip(df[df['y_type']=='gene/protein']['y_name'].str.lower().str.strip(), df[df['y_type']=='gene/protein']['y_id'].astype(str)):
+        primekg_gene_names[gname] = gid
+    existing = set(G_B.edges())
+    dnames = dgn['disease_name'].astype(str).str.lower().str.strip().values
+    gnames = dgn['gene_name'].astype(str).str.lower().str.strip().values
+    new_e = []
+    for i in range(len(dgn)):
+        did = primekg_disease_names.get(dnames[i])
+        pgid = primekg_gene_names.get(gnames[i])
+        if did and pgid and (did,pgid) not in existing and (pgid,did) not in existing:
+            new_e.append((did, pgid))
+            existing.add((did, pgid))
+    G_C.add_edges_from(new_e)
+    disgenet_edges_added = len(new_e)
+    print(f"  DISEASES edges added: {disgenet_edges_added:,}")
 
 print(f"  Graph C: {G_C.number_of_nodes():,} nodes, {G_C.number_of_edges():,} edges")
 
