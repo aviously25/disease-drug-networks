@@ -1,10 +1,10 @@
-"""MVP v2: Link Prediction - Run as script for real-time output."""
+"""Rigorous Evaluation for MVP v2: GroupKFold (disease-grouped)."""
 import pandas as pd
 import numpy as np
 import networkx as nx
-from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
+from sklearn.model_selection import cross_val_score, StratifiedKFold, GroupKFold
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, roc_curve, auc
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 from gensim.models import Word2Vec
 import random
 from tqdm import tqdm
@@ -12,25 +12,24 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os, sys, time, warnings, pickle, json
+import os, sys, time, warnings
 warnings.filterwarnings('ignore')
 np.random.seed(42)
 
-RESULTS = {}  # store all results for notebook injection later
+os.makedirs('results', exist_ok=True)
 
-print("=" * 60)
-print("MVP v2: Link Prediction for Drug-Disease Prediction")
-print("=" * 60)
+print("=" * 70)
+print("Rigorous Evaluation: GroupKFold (disease-grouped)")
+print("=" * 70)
 
 # ============================================================
-# Section 2: Load PrimeKG
+# Section 1: Load PrimeKG (reused from run_mvp_v2.py)
 # ============================================================
 t0 = time.time()
-print("\n[1/11] Loading PrimeKG...")
+print("\n[1/6] Loading PrimeKG...")
 df = pd.read_csv('data/kg.csv', low_memory=False)
 print(f"  Loaded: {df.shape[0]:,} edges in {time.time()-t0:.1f}s")
 
-# Normalize drug-disease edges (vectorized)
 dd_mask = ((df['x_type']=='drug')&(df['y_type']=='disease'))|((df['x_type']=='disease')&(df['y_type']=='drug'))
 dd_df = df[dd_mask].copy()
 is_drug_x = dd_df['x_type'] == 'drug'
@@ -48,9 +47,9 @@ off_label = dd_norm[dd_norm['relation']=='off-label use']
 print(f"  Contra: {len(contra):,}, Indica: {len(indica):,}, Off-label: {len(off_label):,}")
 
 # ============================================================
-# Section 3: Select diseases/drugs + build dataset
+# Section 2: Select diseases/drugs + build dataset
 # ============================================================
-print("\n[2/11] Selecting diseases & drugs...")
+print("\n[2/6] Selecting diseases & drugs...")
 both = set(contra['disease_id']) & set(indica['disease_id'])
 dc = contra[contra['disease_id'].isin(both)].groupby(['disease_id','disease_name']).size().reset_index(name='contra_count')
 di = indica[indica['disease_id'].isin(both)].groupby(['disease_id','disease_name']).size().reset_index(name='indica_count')
@@ -74,19 +73,19 @@ neg = indica[(indica['disease_id'].isin(sel_dis_ids))&(indica['drug_id'].isin(se
 pos['label'] = 1; neg['label'] = 0
 df_dataset = pd.concat([pos, neg], ignore_index=True)
 y = df_dataset['label'].values
+disease_ids = df_dataset['disease_id'].values
 N_DISEASES = len(sel_dis_ids); N_DRUGS = len(sel_drug_ids)
 print(f"  {N_DISEASES} diseases, {N_DRUGS} drugs")
 print(f"  Dataset: {len(df_dataset)} samples ({len(pos)} contra, {len(neg)} indica)")
 
-# Target edges to exclude
 target_edges = set()
 for d, dis in zip(df_dataset['drug_id'].astype(str), df_dataset['disease_id'].astype(str)):
     target_edges.add((d, dis)); target_edges.add((dis, d))
 
 # ============================================================
-# Section 4: Build three graphs
+# Section 3: Build three graphs
 # ============================================================
-print("\n[3/11] Building graphs...")
+print("\n[3/6] Building graphs...")
 
 # Graph A: bipartite
 t1 = time.time()
@@ -109,7 +108,7 @@ print(f"  Graph B: {G_B.number_of_nodes():,} nodes, {G_B.number_of_edges():,} ed
 
 # DISEASES database (Jensen Lab) integration for Graph C
 # Replaces DisGeNET which now requires authentication
-print("\n[4/11] DISEASES database integration...")
+print("\n  Loading DISEASES database for Graph C...")
 import requests
 DISGENET_PATH = "data/diseases_knowledge.tsv"
 disgenet_edges_added = 0
@@ -133,22 +132,17 @@ if DISGENET_PATH and os.path.exists(DISGENET_PATH):
     # DISEASES db has no header; cols: protein_id, gene_name, disease_id, disease_name, source, type, score
     dgn = pd.read_csv(DISGENET_PATH, sep='\t', header=None, low_memory=False,
                       names=['protein_id', 'gene_name', 'disease_id', 'disease_name', 'source', 'type', 'score'])
-    print(f"  DISEASES rows: {len(dgn):,}, cols: {list(dgn.columns)[:5]}")
-
-    # Map disease names (lowercase) -> PrimeKG node ID
     primekg_disease_names = {}
     for nid, nname in zip(df[df['x_type']=='disease']['x_id'].astype(str), df[df['x_type']=='disease']['x_name'].str.lower().str.strip()):
         primekg_disease_names[nname] = nid
     for nid, nname in zip(df[df['y_type']=='disease']['y_id'].astype(str), df[df['y_type']=='disease']['y_name'].str.lower().str.strip()):
         primekg_disease_names[nname] = nid
-
     # Map gene symbol (lowercase) -> PrimeKG node ID
     primekg_gene_names = {}
     for gname, gid in zip(df[df['x_type']=='gene/protein']['x_name'].str.lower().str.strip(), df[df['x_type']=='gene/protein']['x_id'].astype(str)):
         primekg_gene_names[gname] = gid
     for gname, gid in zip(df[df['y_type']=='gene/protein']['y_name'].str.lower().str.strip(), df[df['y_type']=='gene/protein']['y_id'].astype(str)):
         primekg_gene_names[gname] = gid
-
     existing = set(G_B.edges())
     dnames = dgn['disease_name'].astype(str).str.lower().str.strip().values
     gnames = dgn['gene_name'].astype(str).str.lower().str.strip().values
@@ -162,23 +156,15 @@ if DISGENET_PATH and os.path.exists(DISGENET_PATH):
     G_C.add_edges_from(new_e)
     disgenet_edges_added = len(new_e)
     print(f"  DISEASES edges added: {disgenet_edges_added:,}")
-else:
-    print("  No DISEASES data. Graph C = Graph B.")
 
 print(f"  Graph C: {G_C.number_of_nodes():,} nodes, {G_C.number_of_edges():,} edges")
-print(f"  Extra edges vs B: {G_C.number_of_edges()-G_B.number_of_edges():,}")
 
-graphs = {'A (no bio edges)': G_A, 'B (full PrimeKG)': G_B, 'C (PrimeKG+DisGeNET)': G_C}
-RESULTS['graphs'] = {n: (G.number_of_nodes(), G.number_of_edges()) for n, G in graphs.items()}
-print(f"\nGraph summary:")
-for name, G in graphs.items():
-    avg_deg = 2*G.number_of_edges()/max(G.number_of_nodes(),1)
-    print(f"  {name}: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges, avg_deg={avg_deg:.1f}")
+graphs = {'A': G_A, 'B': G_B, 'C': G_C}
 
 # ============================================================
-# Section 5: Heuristic scores
+# Section 4: Compute features (heuristics + Node2Vec)
 # ============================================================
-print("\n[5/11] Computing heuristic scores...")
+print("\n[4/6] Computing heuristic scores...")
 
 def compute_heuristic_scores(G, drug_id, disease_id):
     u, v = str(drug_id), str(disease_id)
@@ -206,17 +192,14 @@ def compute_all_heuristics(G, df_dataset, graph_name):
     return result
 
 sys.stdout.flush()
-heuristics_A = compute_all_heuristics(G_A, df_dataset, 'A'); sys.stdout.flush()
-heuristics_B = compute_all_heuristics(G_B, df_dataset, 'B'); sys.stdout.flush()
-heuristics_C = compute_all_heuristics(G_C, df_dataset, 'C'); sys.stdout.flush()
+heuristics = {}
+for gn in ['A', 'B', 'C']:
+    heuristics[gn] = compute_all_heuristics(graphs[gn], df_dataset, gn)
+    sys.stdout.flush()
 
-# ============================================================
-# Section 6: Node2Vec Embeddings
-# ============================================================
-print("\n[6/11] Training Node2Vec embeddings...")
+print("\n[5/6] Training Node2Vec embeddings...")
 
 def deepwalk_random_walks(G, num_walks=10, walk_length=20):
-    """Generate random walks (DeepWalk style - no transition probabilities)."""
     nodes = list(G.nodes())
     walks = []
     for _ in tqdm(range(num_walks), desc="Walks"):
@@ -270,207 +253,191 @@ def compute_emb_features(model, df_dataset, name, dim=128):
     return result
 
 sys.stdout.flush()
-n2v_A = train_n2v(G_A, 'A'); sys.stdout.flush()
-emb_A = compute_emb_features(n2v_A, df_dataset, 'A'); sys.stdout.flush()
-
-n2v_B = train_n2v(G_B, 'B'); sys.stdout.flush()
-emb_B = compute_emb_features(n2v_B, df_dataset, 'B'); sys.stdout.flush()
-
-n2v_C = train_n2v(G_C, 'C'); sys.stdout.flush()
-emb_C = compute_emb_features(n2v_C, df_dataset, 'C'); sys.stdout.flush()
-
-# ============================================================
-# Section 7: Train Models (3 graphs x 3 methods)
-# ============================================================
-print("\n[7/11] Training models (5-fold CV)...")
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-def evaluate_cv(X, y, cv, name):
-    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-    roc = cross_val_score(rf, X, y, cv=cv, scoring='roc_auc')
-    acc = cross_val_score(rf, X, y, cv=cv, scoring='accuracy')
-    f1 = cross_val_score(rf, X, y, cv=cv, scoring='f1')
-    return {'name':name, 'roc_auc_mean':roc.mean(), 'roc_auc_std':roc.std(),
-            'accuracy_mean':acc.mean(), 'accuracy_std':acc.std(),
-            'f1_mean':f1.mean(), 'f1_std':f1.std()}
-
-all_results = []
-for gn, hdf, edf in [('A',heuristics_A,emb_A),('B',heuristics_B,emb_B),('C',heuristics_C,emb_C)]:
-    Xh = hdf.values; Xe = edf.values; Xc = np.hstack([Xh, Xe])
-    print(f"\n  --- Graph {gn} ---")
-    r1 = evaluate_cv(Xh, y, cv, f'Graph {gn} - Heuristics')
-    print(f"    Heuristics: AUC={r1['roc_auc_mean']:.3f}+-{r1['roc_auc_std']:.3f}")
-    all_results.append(r1); sys.stdout.flush()
-    r2 = evaluate_cv(Xe, y, cv, f'Graph {gn} - Node2Vec')
-    print(f"    Node2Vec:   AUC={r2['roc_auc_mean']:.3f}+-{r2['roc_auc_std']:.3f}")
-    all_results.append(r2); sys.stdout.flush()
-    r3 = evaluate_cv(Xc, y, cv, f'Graph {gn} - Combined')
-    print(f"    Combined:   AUC={r3['roc_auc_mean']:.3f}+-{r3['roc_auc_std']:.3f}")
-    all_results.append(r3); sys.stdout.flush()
-
-results_df = pd.DataFrame(all_results).set_index('name').sort_values('roc_auc_mean', ascending=False)
-print("\nAll results sorted by AUC:")
-for idx, row in results_df.iterrows():
-    print(f"  {idx:<35} AUC={row['roc_auc_mean']:.3f} Acc={row['accuracy_mean']:.3f} F1={row['f1_mean']:.3f}")
-RESULTS['cv_results'] = results_df.to_dict()
-
-# ============================================================
-# Section 8: LODO CV (sampled 50 diseases)
-# ============================================================
-print("\n[8/11] Disease-level CV (LODO, 50 sampled diseases)...")
-disease_ids = df_dataset['disease_id'].values
-
-def lodo_cv(X, y, disease_ids, name, max_d=50):
-    unique_d = sorted(set(disease_ids))
-    if len(unique_d) > max_d:
-        rng = np.random.RandomState(42)
-        unique_d = sorted(rng.choice(unique_d, size=max_d, replace=False))
-    results = []
-    for hd in tqdm(unique_d, desc=f"LODO {name}"):
-        tm = np.array([d==hd for d in disease_ids])
-        if tm.sum()<5: continue
-        yt = y[tm]
-        if len(np.unique(yt))<2: continue
-        rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-        rf.fit(X[~tm], y[~tm])
-        yp = rf.predict_proba(X[tm])[:,1]
-        ypred = rf.predict(X[tm])
-        results.append({'disease_id':hd, 'roc_auc':roc_auc_score(yt,yp), 'accuracy':accuracy_score(yt,ypred), 'f1':f1_score(yt,ypred)})
-    return pd.DataFrame(results)
-
-lodo_results = {}
-for gn, hdf, edf in [('A',heuristics_A,emb_A),('B',heuristics_B,emb_B),('C',heuristics_C,emb_C)]:
-    Xc = np.hstack([hdf.values, edf.values])
-    lr = lodo_cv(Xc, y, disease_ids, f'Graph {gn}')
-    lodo_results[gn] = lr
-    print(f"  Graph {gn}: AUC={lr['roc_auc'].mean():.3f}+-{lr['roc_auc'].std():.3f} ({len(lr)} diseases)")
+embeddings = {}
+n2v_models = {}
+for gn in ['A', 'B', 'C']:
+    n2v_models[gn] = train_n2v(graphs[gn], gn)
+    embeddings[gn] = compute_emb_features(n2v_models[gn], df_dataset, gn)
     sys.stdout.flush()
 
-RESULTS['lodo'] = {g: {'mean': r['roc_auc'].mean(), 'std': r['roc_auc'].std(), 'n': len(r)} for g, r in lodo_results.items()}
+# Build combined feature matrices for each graph
+X_combined = {}
+X_heuristic = {}
+X_embedding = {}
+for gn in ['A', 'B', 'C']:
+    X_heuristic[gn] = heuristics[gn].values
+    X_embedding[gn] = embeddings[gn].values
+    X_combined[gn] = np.hstack([X_heuristic[gn], X_embedding[gn]])
+    print(f"  Graph {gn} combined features: {X_combined[gn].shape}")
+
 
 # ============================================================
-# Section 9: Comparison with MVP v1
+# Section 5: GroupKFold + Standard CV
 # ============================================================
-print("\n[9/11] Comparison with MVP v1...")
-print(f"\n{'Model':<40} {'ROC-AUC':>10} {'Accuracy':>10} {'F1':>10} {'LODO AUC':>10}")
-print("-"*80)
-print("--- MVP v1 (Feature Engineering) ---")
-print(f"{'RF_Combined (v1)':<40} {'0.985':>10} {'0.947':>10} {'0.959':>10} {'0.831':>10}")
-print("\n--- MVP v2 (Link Prediction) ---")
-for idx, row in results_df.iterrows():
-    gn = idx.split(' ')[1]
-    la = lodo_results.get(gn, pd.DataFrame())
-    ls = f"{la['roc_auc'].mean():.3f}" if len(la)>0 else 'N/A'
-    print(f"{idx:<40} {row['roc_auc_mean']:>10.3f} {row['accuracy_mean']:>10.3f} {row['f1_mean']:>10.3f} {ls:>10}")
+print("\n" + "=" * 70)
+print("[6/6] EVALUATION: GroupKFold (disease-grouped) vs Standard CV")
+print("=" * 70)
+
+def group_kfold_cv(X, y, disease_ids, name, n_splits=5):
+    """GroupKFold with disease as group - no disease in both train and test."""
+    gkf = GroupKFold(n_splits=n_splits)
+    aucs = []; accs = []; f1s = []
+    for fold, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups=disease_ids)):
+        rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        rf.fit(X[train_idx], y[train_idx])
+        yp = rf.predict_proba(X[test_idx])[:, 1]
+        ypred = rf.predict(X[test_idx])
+        yt = y[test_idx]
+        aucs.append(roc_auc_score(yt, yp))
+        accs.append(accuracy_score(yt, ypred))
+        f1s.append(f1_score(yt, ypred))
+        print(f"    Fold {fold+1}: AUC={aucs[-1]:.3f}, Acc={accs[-1]:.3f}, F1={f1s[-1]:.3f} (test={len(test_idx)})")
+    return {
+        'name': name,
+        'roc_auc_mean': np.mean(aucs), 'roc_auc_std': np.std(aucs),
+        'accuracy_mean': np.mean(accs), 'accuracy_std': np.std(accs),
+        'f1_mean': np.mean(f1s), 'f1_std': np.std(f1s),
+    }
+
+# GroupKFold: all 3 graphs x all 3 methods
+methods = ['Heuristics', 'Node2Vec', 'Combined']
+gkf_results = []
+for gn in ['A', 'B', 'C']:
+    print(f"\n  --- Graph {gn} (GroupKFold) ---")
+    for method_name, X_method in [('Heuristics', X_heuristic[gn]), ('Node2Vec', X_embedding[gn]), ('Combined', X_combined[gn])]:
+        print(f"  {method_name}:")
+        r = group_kfold_cv(X_method, y, disease_ids, f"Graph {gn} - {method_name}")
+        gkf_results.append(r)
+        print(f"    => AUC={r['roc_auc_mean']:.3f}+-{r['roc_auc_std']:.3f}")
+    sys.stdout.flush()
+
+gkf_df = pd.DataFrame(gkf_results).set_index('name')
+
+# Standard CV for comparison
+print("\n  Running standard 5-fold CV for comparison...")
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+standard_cv_results = []
+for gn in ['A', 'B', 'C']:
+    for method_name, X_method in [('Heuristics', X_heuristic[gn]), ('Node2Vec', X_embedding[gn]), ('Combined', X_combined[gn])]:
+        rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        roc = cross_val_score(rf, X_method, y, cv=cv, scoring='roc_auc')
+        acc = cross_val_score(rf, X_method, y, cv=cv, scoring='accuracy')
+        f1 = cross_val_score(rf, X_method, y, cv=cv, scoring='f1')
+        standard_cv_results.append({
+            'name': f'Graph {gn} - {method_name}',
+            'roc_auc_mean': roc.mean(), 'roc_auc_std': roc.std(),
+            'accuracy_mean': acc.mean(), 'accuracy_std': acc.std(),
+            'f1_mean': f1.mean(), 'f1_std': f1.std(),
+        })
+std_cv_df = pd.DataFrame(standard_cv_results).set_index('name')
+
 
 # ============================================================
-# Section 10: Visualization
+# Visualization
 # ============================================================
-print("\n[10/11] Creating visualizations...")
+print("\nCreating visualizations...")
 fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
-# Bar chart
-ax = axes[0,0]
-graph_labels = ['A (no bio)','B (full PrimeKG)','C (+DisGeNET)']
-methods = ['Heuristics','Node2Vec','Combined']
-colors = ['#2196F3','#FF9800','#4CAF50']
-x = np.arange(3); width = 0.25
-for i, m in enumerate(methods):
-    vals = [results_df.loc[f'Graph {g} - {m}','roc_auc_mean'] if f'Graph {g} - {m}' in results_df.index else 0 for g in 'ABC']
-    errs = [results_df.loc[f'Graph {g} - {m}','roc_auc_std'] if f'Graph {g} - {m}' in results_df.index else 0 for g in 'ABC']
-    ax.bar(x+i*width, vals, width, yerr=errs, label=m, color=colors[i], capsize=3, alpha=0.85)
-ax.set_ylabel('ROC-AUC'); ax.set_title('ROC-AUC by Graph Config & Method', fontweight='bold')
-ax.set_xticks(x+width); ax.set_xticklabels(graph_labels); ax.legend(); ax.set_ylim([0.4,1.0])
-ax.axhline(y=0.5, color='red', linestyle='--', alpha=0.3); ax.grid(axis='y', alpha=0.3)
+# Plot 1: Bar chart - Standard CV vs GroupKFold (Combined method)
+ax = axes[0, 0]
+graph_labels = ['A', 'B', 'C']
+bar_width = 0.3
+x = np.arange(len(graph_labels))
+std_vals = [std_cv_df.loc[f'Graph {g} - Combined', 'roc_auc_mean'] for g in graph_labels]
+std_errs = [std_cv_df.loc[f'Graph {g} - Combined', 'roc_auc_std'] for g in graph_labels]
+gkf_vals = [gkf_df.loc[f'Graph {g} - Combined', 'roc_auc_mean'] for g in graph_labels]
+gkf_errs = [gkf_df.loc[f'Graph {g} - Combined', 'roc_auc_std'] for g in graph_labels]
+bars1 = ax.bar(x - bar_width/2, std_vals, bar_width, yerr=std_errs, label='Standard CV', color='#2196F3', capsize=5, alpha=0.85)
+bars2 = ax.bar(x + bar_width/2, gkf_vals, bar_width, yerr=gkf_errs, label='GroupKFold', color='#FF9800', capsize=5, alpha=0.85)
+ax.set_ylabel('ROC-AUC'); ax.set_title('Standard CV vs GroupKFold (Combined Method)', fontweight='bold')
+ax.set_xticks(x); ax.set_xticklabels([f'Graph {g}' for g in graph_labels])
+ax.legend(); ax.set_ylim([0.4, 1.05])
+ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.3); ax.grid(axis='y', alpha=0.3)
+for bars in [bars1, bars2]:
+    for bar in bars:
+        height = bar.get_height()
+        ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width()/2, height),
+                    xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=8)
 
-# Heatmap
-ax = axes[0,1]
-hm = np.zeros((3,3))
-for i, g in enumerate('ABC'):
+# Plot 2: GroupKFold heatmap (all methods)
+ax = axes[0, 1]
+hm = np.zeros((3, 3))
+for i, g in enumerate(graph_labels):
     for j, m in enumerate(methods):
         k = f'Graph {g} - {m}'
-        hm[i,j] = results_df.loc[k,'roc_auc_mean'] if k in results_df.index else 0
-sns.heatmap(hm, annot=True, fmt='.3f', cmap='YlOrRd', xticklabels=methods, yticklabels=graph_labels, ax=ax, vmin=0.5, vmax=1.0)
-ax.set_title('ROC-AUC Heatmap', fontweight='bold')
+        hm[i, j] = gkf_df.loc[k, 'roc_auc_mean'] if k in gkf_df.index else 0
+sns.heatmap(hm, annot=True, fmt='.3f', cmap='YlOrRd',
+            xticklabels=methods, yticklabels=[f'Graph {g}' for g in graph_labels],
+            ax=ax, vmin=0.5, vmax=1.0)
+ax.set_title('GroupKFold ROC-AUC (Disease-Grouped)', fontweight='bold')
 
-# LODO
-ax = axes[1,0]
-lm = [lodo_results[g]['roc_auc'].mean() if g in lodo_results else 0 for g in 'ABC']
-ls = [lodo_results[g]['roc_auc'].std() if g in lodo_results else 0 for g in 'ABC']
-ax.bar(graph_labels, lm, yerr=ls, color=colors, capsize=5, alpha=0.85)
-ax.axhline(y=0.831, color='red', linestyle='--', alpha=0.7, label='MVP v1 LODO (0.831)')
-ax.set_ylabel('ROC-AUC'); ax.set_title('Disease-Level CV (LODO)', fontweight='bold')
-ax.legend(); ax.set_ylim([0.4,1.0]); ax.grid(axis='y', alpha=0.3)
+# Plot 3: Gap analysis - how much does standard CV overestimate?
+ax = axes[1, 0]
+gaps = {}
+for m in methods:
+    gaps[m] = [std_cv_df.loc[f'Graph {g} - {m}', 'roc_auc_mean'] - gkf_df.loc[f'Graph {g} - {m}', 'roc_auc_mean'] for g in graph_labels]
+bar_width = 0.25
+colors = ['#2196F3', '#FF9800', '#4CAF50']
+for i, m in enumerate(methods):
+    ax.bar(x + i*bar_width, gaps[m], bar_width, label=m, color=colors[i], alpha=0.85)
+ax.set_ylabel('AUC Gap (Standard - GroupKFold)'); ax.set_title('Standard CV Overestimation', fontweight='bold')
+ax.set_xticks(x + bar_width); ax.set_xticklabels([f'Graph {g}' for g in graph_labels])
+ax.legend(); ax.grid(axis='y', alpha=0.3)
+ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
 
-# ROC curves
-ax = axes[1,1]
-for gn, hdf, edf, col in [('A',heuristics_A,emb_A,'#2196F3'),('B',heuristics_B,emb_B,'#FF9800'),('C',heuristics_C,emb_C,'#4CAF50')]:
-    Xc = np.hstack([hdf.values, edf.values])
-    Xtr,Xte,ytr,yte = train_test_split(Xc, y, test_size=0.2, random_state=42, stratify=y)
-    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-    rf.fit(Xtr, ytr)
-    yp = rf.predict_proba(Xte)[:,1]
-    fpr, tpr, _ = roc_curve(yte, yp)
-    ax.plot(fpr, tpr, color=col, lw=2, label=f'Graph {gn} (AUC={auc(fpr,tpr):.3f})')
-ax.plot([0,1],[0,1],'k--',alpha=0.3)
-ax.set_xlabel('FPR'); ax.set_ylabel('TPR'); ax.set_title('ROC Curves - Combined', fontweight='bold')
-ax.legend(loc='lower right'); ax.grid(alpha=0.3)
+# Plot 4: All methods comparison (GroupKFold)
+ax = axes[1, 1]
+bar_width = 0.25
+for i, m in enumerate(methods):
+    vals = [gkf_df.loc[f'Graph {g} - {m}', 'roc_auc_mean'] for g in graph_labels]
+    errs = [gkf_df.loc[f'Graph {g} - {m}', 'roc_auc_std'] for g in graph_labels]
+    ax.bar(x + i*bar_width, vals, bar_width, yerr=errs, label=m, color=colors[i], capsize=3, alpha=0.85)
+ax.set_ylabel('ROC-AUC'); ax.set_title('GroupKFold: All Methods', fontweight='bold')
+ax.set_xticks(x + bar_width); ax.set_xticklabels([f'Graph {g}' for g in graph_labels])
+ax.legend(); ax.set_ylim([0.4, 1.05])
+ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.3); ax.grid(axis='y', alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('mvp_v2_results.png', dpi=150, bbox_inches='tight')
-print("  Saved: mvp_v2_results.png")
+plt.savefig('results/mvp_v2_evaluation.png', dpi=150, bbox_inches='tight')
+print("Saved: results/mvp_v2_evaluation.png")
+
 
 # ============================================================
-# Section 11: Summary
+# Summary Table
 # ============================================================
-print("\n[11/11] Summary")
-print("="*70)
-print(f"DATASET: {len(df_dataset)} samples ({N_DISEASES} diseases, {N_DRUGS} drugs)")
-print(f"\nGRAPH CONFIGS:")
-for name, G in graphs.items():
-    print(f"  {name}: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
-print(f"  DisGeNET edges added: {disgenet_edges_added:,}")
+print("\n" + "=" * 70)
+print("SUMMARY OF EVALUATION RESULTS")
+print("=" * 70)
 
-print(f"\n5-FOLD CV RESULTS:")
-for idx, row in results_df.iterrows():
-    print(f"  {idx:<35} AUC={row['roc_auc_mean']:.3f}+-{row['roc_auc_std']:.3f}")
+print(f"\n{'Protocol':<25} {'Graph':<10} {'Method':<15} {'AUC':>8} {'Std':>8} {'Acc':>8} {'F1':>8}")
+print("-" * 80)
 
-print(f"\nLODO RESULTS (Combined, 50 diseases):")
-for g in 'ABC':
-    if g in lodo_results and len(lodo_results[g])>0:
-        lr = lodo_results[g]
-        print(f"  Graph {g}: AUC={lr['roc_auc'].mean():.3f}+-{lr['roc_auc'].std():.3f}")
+for gn in ['A', 'B', 'C']:
+    for m in methods:
+        k = f'Graph {gn} - {m}'
+        r = std_cv_df.loc[k]
+        print(f"{'Standard CV':<25} {'Graph '+gn:<10} {m:<15} {r['roc_auc_mean']:>8.3f} {r['roc_auc_std']:>8.3f} {r['accuracy_mean']:>8.3f} {r['f1_mean']:>8.3f}")
 
-best_v2 = results_df.iloc[0]
-print(f"\nBest MVP v1: RF_Combined AUC=0.985, LODO=0.831")
-print(f"Best MVP v2: {results_df.index[0]} AUC={best_v2['roc_auc_mean']:.3f}")
+print("-" * 80)
 
-# Key takeaways
-best_bg = {g: results_df[results_df.index.str.contains(f'Graph {g}')]['roc_auc_mean'].max() for g in 'ABC'}
-bg = max(best_bg, key=best_bg.get)
-print(f"\nKEY TAKEAWAYS:")
-print(f"  1. Best graph: Graph {bg} (AUC={best_bg[bg]:.3f})")
+for gn in ['A', 'B', 'C']:
+    for m in methods:
+        k = f'Graph {gn} - {m}'
+        r = gkf_df.loc[k]
+        print(f"{'GroupKFold (disease)':<25} {'Graph '+gn:<10} {m:<15} {r['roc_auc_mean']:>8.3f} {r['roc_auc_std']:>8.3f} {r['accuracy_mean']:>8.3f} {r['f1_mean']:>8.3f}")
 
-dgn_diff = best_bg.get('C',0) - best_bg.get('B',0)
-if dgn_diff > 0.005: print(f"  2. DisGeNET HELPS: +{dgn_diff:.3f}")
-elif dgn_diff < -0.005: print(f"  2. DisGeNET HURTS: {dgn_diff:.3f}")
-else: print(f"  2. DisGeNET minimal effect: {dgn_diff:+.3f}")
+print("-" * 80)
 
-v_diff = best_v2['roc_auc_mean'] - 0.985
-if v_diff > 0.005: print(f"  3. Link prediction OUTPERFORMS feature eng: {v_diff:+.3f}")
-elif v_diff > -0.005: print(f"  3. Link prediction COMPARABLE to feature eng: {v_diff:+.3f}")
-else: print(f"  3. Feature eng outperforms link prediction: {v_diff:+.3f}")
+print("\nKEY FINDINGS:")
+for gn in ['A', 'B', 'C']:
+    std_auc = std_cv_df.loc[f'Graph {gn} - Combined', 'roc_auc_mean']
+    gkf_auc = gkf_df.loc[f'Graph {gn} - Combined', 'roc_auc_mean']
+    gap = std_auc - gkf_auc
+    print(f"  Graph {gn}: Standard CV={std_auc:.3f}, GroupKFold={gkf_auc:.3f}  (inflation={gap:+.3f})")
 
-method_best = {m: results_df[results_df.index.str.contains(m)]['roc_auc_mean'].max() for m in methods}
-bm = max(method_best, key=method_best.get)
-print(f"  4. Best method: {bm} (AUC={method_best[bm]:.3f})")
+best_gkf = gkf_df['roc_auc_mean'].idxmax()
+print(f"\n  Best GroupKFold result: {best_gkf} (AUC={gkf_df.loc[best_gkf, 'roc_auc_mean']:.3f})")
 
-# Save results for notebook injection
-RESULTS['best_v2'] = best_v2['roc_auc_mean']
-RESULTS['disgenet_added'] = disgenet_edges_added
-with open('mvp_v2_results.pkl', 'wb') as f:
-    pickle.dump(RESULTS, f)
-
-print(f"\nTotal runtime: {time.time()-t0:.1f}s")
-print("="*70)
+print(f"\nTotal runtime: {time.time()-t0:.1f}s ({(time.time()-t0)/60:.1f} min)")
+print("=" * 70)
 print("DONE")

@@ -18,6 +18,7 @@ warnings.filterwarnings('ignore')
 np.random.seed(42)
 
 RESULTS = {}  # store all results for notebook injection later
+os.makedirs('results', exist_ok=True)
 
 print("=" * 60)
 print("MVP v3: Comparing External KG Sources")
@@ -303,7 +304,6 @@ existing_E = set(G_E.edges())
 
 # Add DISEASES edges
 if DISEASES_PATH and os.path.exists(DISEASES_PATH) and diseases_edges_added > 0:
-    # Reuse edges already computed for G_B
     dgn_dnames = dgn['disease_name'].astype(str).str.lower().str.strip().values
     dgn_gnames = dgn['gene_name'].astype(str).str.lower().str.strip().values
     new_e = []
@@ -400,15 +400,16 @@ heuristics_D = compute_all_heuristics(G_D, df_dataset, 'D'); sys.stdout.flush()
 heuristics_E = compute_all_heuristics(G_E, df_dataset, 'E'); sys.stdout.flush()
 
 # ============================================================
-# [6/10] Node2Vec embeddings
+# [6/10] Node2Vec helpers (training happens inside CV folds)
 # ============================================================
-print("\n[6/10] Training Node2Vec embeddings...")
+print("\n[6/10] Defining Node2Vec helpers (within-fold training)...")
 
-def deepwalk_random_walks(G, num_walks=10, walk_length=20):
+def deepwalk_random_walks(G, num_walks=10, walk_length=20, verbose=False):
     """Generate random walks (DeepWalk style)."""
     nodes = list(G.nodes())
     walks = []
-    for _ in tqdm(range(num_walks), desc="Walks"):
+    iter_ = tqdm(range(num_walks), desc="Walks") if verbose else range(num_walks)
+    for _ in iter_:
         random.shuffle(nodes)
         for node in nodes:
             walk = [node]
@@ -420,95 +421,130 @@ def deepwalk_random_walks(G, num_walks=10, walk_length=20):
             walks.append(walk)
     return walks
 
-def train_n2v(G, name, dim=128):
-    n_nodes = G.number_of_nodes()
-    if n_nodes > 30000:
-        nw, wl = 10, 15
-    elif n_nodes > 10000:
-        nw, wl = 15, 20
-    else:
-        nw, wl = 30, 30
-    print(f"  Graph {name}: {n_nodes:,} nodes, walks={nw}, length={wl}")
-    sys.stdout.flush()
-    t = time.time()
-    walks = deepwalk_random_walks(G, num_walks=nw, walk_length=wl)
-    print(f"  Walks generated: {len(walks):,} in {time.time()-t:.1f}s")
-    sys.stdout.flush()
-    model = Word2Vec(walks, vector_size=dim, window=10, min_count=1, sg=1, workers=4, epochs=1)
-    print(f"  Embeddings: {len(model.wv)} nodes in {time.time()-t:.1f}s total")
-    return model
+def _n2v_params(G):
+    n = G.number_of_nodes()
+    if n > 30000: return 10, 15
+    if n > 10000: return 15, 20
+    return 30, 30
 
-def compute_emb_features(model, df_dataset, name, dim=128):
-    drug_ids = df_dataset['drug_id'].astype(str).values
-    disease_ids = df_dataset['disease_id'].astype(str).values
-    n = len(df_dataset)
+def train_n2v_fold(G, dim=128):
+    """Train Node2Vec silently; used inside CV loops so each fold gets a fresh model."""
+    nw, wl = _n2v_params(G)
+    walks = deepwalk_random_walks(G, num_walks=nw, walk_length=wl, verbose=False)
+    return Word2Vec(walks, vector_size=dim, window=10, min_count=1, sg=1, workers=4, epochs=1)
+
+def emb_for_indices(model, drug_ids, disease_ids, indices, dim=128):
+    """Compute Hadamard + cosine + L2 features for a subset of sample indices.
+    Samples whose nodes are OOV in the model get zero vectors."""
+    n = len(indices)
     had = np.zeros((n, dim)); cos = np.zeros(n); l2 = np.zeros(n)
-    found = 0
-    for i in range(n):
-        if drug_ids[i] in model.wv and disease_ids[i] in model.wv:
-            de = model.wv[drug_ids[i]]; dise = model.wv[disease_ids[i]]
-            had[i] = de*dise
-            np_d = np.linalg.norm(de)*np.linalg.norm(dise)
-            cos[i] = np.dot(de,dise)/np_d if np_d>0 else 0
-            l2[i] = np.linalg.norm(de-dise)
-            found += 1
-    cols = [f'had_{j}_{name}' for j in range(dim)]
-    result = pd.DataFrame(had, columns=cols)
-    result[f'cos_sim_{name}'] = cos; result[f'l2_dist_{name}'] = l2
-    print(f"  Pairs embedded: {found}/{n}")
-    return result
+    for j, i in enumerate(indices):
+        u, v = drug_ids[i], disease_ids[i]
+        if u in model.wv and v in model.wv:
+            de = model.wv[u]; dise = model.wv[v]
+            had[j] = de * dise
+            np_d = np.linalg.norm(de) * np.linalg.norm(dise)
+            cos[j] = np.dot(de, dise) / np_d if np_d > 0 else 0.0
+            l2[j] = np.linalg.norm(de - dise)
+    return np.hstack([had, cos.reshape(-1, 1), l2.reshape(-1, 1)])
 
-sys.stdout.flush()
-n2v_A = train_n2v(G_A, 'A'); sys.stdout.flush()
-emb_A = compute_emb_features(n2v_A, df_dataset, 'A'); sys.stdout.flush()
-
-n2v_B = train_n2v(G_B, 'B'); sys.stdout.flush()
-emb_B = compute_emb_features(n2v_B, df_dataset, 'B'); sys.stdout.flush()
-
-n2v_C = train_n2v(G_C, 'C'); sys.stdout.flush()
-emb_C = compute_emb_features(n2v_C, df_dataset, 'C'); sys.stdout.flush()
-
-n2v_D = train_n2v(G_D, 'D'); sys.stdout.flush()
-emb_D = compute_emb_features(n2v_D, df_dataset, 'D'); sys.stdout.flush()
-
-n2v_E = train_n2v(G_E, 'E'); sys.stdout.flush()
-emb_E = compute_emb_features(n2v_E, df_dataset, 'E'); sys.stdout.flush()
+print("  Node2Vec will be retrained from scratch in every CV fold.")
+print("  (5 folds × 5 graphs = 25 training runs for CV; 50 × 5 = 250 for LODO)")
 
 # ============================================================
-# [7/10] 5-fold CV
+# [7/10] 5-fold CV with within-fold Node2Vec
 # ============================================================
-print("\n[7/10] Training models (5-fold CV)...")
+print("\n[7/10] Training models (5-fold CV, Node2Vec retrained each fold)...")
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-def evaluate_cv(X, y, cv, name):
-    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-    roc = cross_val_score(rf, X, y, cv=cv, scoring='roc_auc')
-    acc = cross_val_score(rf, X, y, cv=cv, scoring='accuracy')
-    f1 = cross_val_score(rf, X, y, cv=cv, scoring='f1')
-    return {'name': name, 'roc_auc_mean': roc.mean(), 'roc_auc_std': roc.std(),
-            'accuracy_mean': acc.mean(), 'accuracy_std': acc.std(),
-            'f1_mean': f1.mean(), 'f1_std': f1.std()}
+drug_ids_arr    = df_dataset['drug_id'].astype(str).values
+disease_ids_arr = df_dataset['disease_id'].astype(str).values
+
+def evaluate_cv_within_fold(G, Xh, y, drug_ids, disease_ids, cv, graph_name, dim=128):
+    """
+    5-fold CV where Node2Vec is retrained fresh in each fold on the full KG.
+    - Heuristics are deterministic graph statistics, pre-computed once (no leakage).
+    - Node2Vec is trained fresh per fold; embedding features are computed separately
+      for train and test indices so the classifier never sees test embeddings at fit time.
+    - Test samples whose nodes are OOV get zero embedding vectors.
+    Returns one result dict per feature set: Heuristics / Node2Vec / Combined.
+    """
+    roc_h=[]; roc_e=[]; roc_c=[]
+    acc_h=[]; acc_e=[]; acc_c=[]
+    f1_h=[];  f1_e=[];  f1_c=[]
+
+    for fold, (tr, te) in enumerate(cv.split(Xh, y)):
+        t_fold = time.time()
+        print(f"    fold {fold+1}/5 — training Node2Vec on Graph {graph_name}...", end=' ', flush=True)
+
+        # Fresh Node2Vec model trained on the full graph (labels not encoded in graph;
+        # retraining per fold ensures each model is fit without knowledge of the fold split)
+        model = train_n2v_fold(G, dim=dim)
+
+        # Embedding features computed separately for train and test subsets
+        emb_tr = emb_for_indices(model, drug_ids, disease_ids, tr, dim)
+        emb_te = emb_for_indices(model, drug_ids, disease_ids, te, dim)
+
+        Xh_tr, Xh_te = Xh[tr], Xh[te]
+        Xc_tr = np.hstack([Xh_tr, emb_tr])
+        Xc_te = np.hstack([Xh_te, emb_te])
+        y_tr,  y_te  = y[tr], y[te]
+
+        rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+
+        # Heuristics only
+        rf.fit(Xh_tr, y_tr)
+        roc_h.append(roc_auc_score(y_te, rf.predict_proba(Xh_te)[:,1]))
+        acc_h.append(accuracy_score(y_te, rf.predict(Xh_te)))
+        f1_h.append(f1_score(y_te, rf.predict(Xh_te)))
+
+        # Node2Vec only
+        rf.fit(emb_tr, y_tr)
+        roc_e.append(roc_auc_score(y_te, rf.predict_proba(emb_te)[:,1]))
+        acc_e.append(accuracy_score(y_te, rf.predict(emb_te)))
+        f1_e.append(f1_score(y_te, rf.predict(emb_te)))
+
+        # Combined
+        rf.fit(Xc_tr, y_tr)
+        roc_c.append(roc_auc_score(y_te, rf.predict_proba(Xc_te)[:,1]))
+        acc_c.append(accuracy_score(y_te, rf.predict(Xc_te)))
+        f1_c.append(f1_score(y_te, rf.predict(Xc_te)))
+
+        print(f"AUC(combined)={roc_c[-1]:.3f}  ({time.time()-t_fold:.0f}s)")
+        sys.stdout.flush()
+
+    def _pack(name, rocs, accs, f1s):
+        return {'name': name,
+                'roc_auc_mean': np.mean(rocs), 'roc_auc_std': np.std(rocs),
+                'accuracy_mean': np.mean(accs), 'accuracy_std': np.std(accs),
+                'f1_mean': np.mean(f1s),        'f1_std': np.std(f1s)}
+
+    return [
+        _pack(f'Graph {graph_name} - Heuristics', roc_h, acc_h, f1_h),
+        _pack(f'Graph {graph_name} - Node2Vec',   roc_e, acc_e, f1_e),
+        _pack(f'Graph {graph_name} - Combined',   roc_c, acc_c, f1_c),
+    ]
+
+# graph_data: (graph_key, NetworkX graph, heuristic DataFrame)
+graph_data = [
+    ('A', G_A, heuristics_A),
+    ('B', G_B, heuristics_B),
+    ('C', G_C, heuristics_C),
+    ('D', G_D, heuristics_D),
+    ('E', G_E, heuristics_E),
+]
 
 all_results = []
-graph_data = [
-    ('A', heuristics_A, emb_A),
-    ('B', heuristics_B, emb_B),
-    ('C', heuristics_C, emb_C),
-    ('D', heuristics_D, emb_D),
-    ('E', heuristics_E, emb_E),
-]
-for gn, hdf, edf in graph_data:
-    Xh = hdf.values; Xe = edf.values; Xc = np.hstack([Xh, Xe])
-    print(f"\n  --- Graph {gn} ---")
-    r1 = evaluate_cv(Xh, y, cv, f'Graph {gn} - Heuristics')
-    print(f"    Heuristics: AUC={r1['roc_auc_mean']:.3f}+-{r1['roc_auc_std']:.3f}")
-    all_results.append(r1); sys.stdout.flush()
-    r2 = evaluate_cv(Xe, y, cv, f'Graph {gn} - Node2Vec')
-    print(f"    Node2Vec:   AUC={r2['roc_auc_mean']:.3f}+-{r2['roc_auc_std']:.3f}")
-    all_results.append(r2); sys.stdout.flush()
-    r3 = evaluate_cv(Xc, y, cv, f'Graph {gn} - Combined')
-    print(f"    Combined:   AUC={r3['roc_auc_mean']:.3f}+-{r3['roc_auc_std']:.3f}")
-    all_results.append(r3); sys.stdout.flush()
+for gn, G, hdf in graph_data:
+    print(f"\n  --- Graph {gn} ({G.number_of_nodes():,} nodes) ---")
+    rows = evaluate_cv_within_fold(
+        G, hdf.values, y, drug_ids_arr, disease_ids_arr, cv, gn)
+    for r in rows:
+        print(f"    {r['name'].split(' - ')[1]:<12} "
+              f"AUC={r['roc_auc_mean']:.3f}+-{r['roc_auc_std']:.3f}  "
+              f"Acc={r['accuracy_mean']:.3f}  F1={r['f1_mean']:.3f}")
+        all_results.append(r)
+    sys.stdout.flush()
 
 results_df = pd.DataFrame(all_results).set_index('name').sort_values('roc_auc_mean', ascending=False)
 print("\nAll results sorted by AUC:")
@@ -517,34 +553,49 @@ for idx, row in results_df.iterrows():
 RESULTS['cv_results'] = results_df.to_dict()
 
 # ============================================================
-# [8/10] LODO CV (50 sampled diseases)
+# [8/10] LODO CV (50 sampled diseases, within-fold Node2Vec)
 # ============================================================
-print("\n[8/10] Disease-level CV (LODO, 50 sampled diseases)...")
-disease_ids_arr = df_dataset['disease_id'].values
+print("\n[8/10] Disease-level CV (LODO, 50 diseases, Node2Vec retrained each split)...")
 
-def lodo_cv(X, y, disease_ids, name, max_d=50):
+def lodo_cv_within_fold(G, Xh, y, drug_ids, disease_ids, name, max_d=50, dim=128):
+    """
+    LODO CV where Node2Vec is retrained for each held-out disease.
+    Uses Combined features (heuristics + embeddings).
+    """
     unique_d = sorted(set(disease_ids))
     if len(unique_d) > max_d:
         rng = np.random.RandomState(42)
         unique_d = sorted(rng.choice(unique_d, size=max_d, replace=False))
     results = []
     for hd in tqdm(unique_d, desc=f"LODO {name}"):
-        tm = np.array([d==hd for d in disease_ids])
-        if tm.sum()<5: continue
+        tm = np.array([d == hd for d in disease_ids])
+        if tm.sum() < 5: continue
         yt = y[tm]
-        if len(np.unique(yt))<2: continue
+        if len(np.unique(yt)) < 2: continue
+
+        tr = np.where(~tm)[0]
+        te = np.where(tm)[0]
+
+        model  = train_n2v_fold(G, dim=dim)
+        emb_tr = emb_for_indices(model, drug_ids, disease_ids, tr, dim)
+        emb_te = emb_for_indices(model, drug_ids, disease_ids, te, dim)
+
+        Xc_tr = np.hstack([Xh[tr], emb_tr])
+        Xc_te = np.hstack([Xh[te], emb_te])
+
         rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-        rf.fit(X[~tm], y[~tm])
-        yp = rf.predict_proba(X[tm])[:,1]
-        ypred = rf.predict(X[tm])
-        results.append({'disease_id': hd, 'roc_auc': roc_auc_score(yt,yp),
-                        'accuracy': accuracy_score(yt,ypred), 'f1': f1_score(yt,ypred)})
+        rf.fit(Xc_tr, y[tr])
+        yp    = rf.predict_proba(Xc_te)[:,1]
+        ypred = rf.predict(Xc_te)
+        results.append({'disease_id': hd,
+                        'roc_auc':    roc_auc_score(yt, yp),
+                        'accuracy':   accuracy_score(yt, ypred),
+                        'f1':         f1_score(yt, ypred)})
     return pd.DataFrame(results)
 
 lodo_results = {}
-for gn, hdf, edf in graph_data:
-    Xc = np.hstack([hdf.values, edf.values])
-    lr = lodo_cv(Xc, y, disease_ids_arr, f'Graph {gn}')
+for gn, G, hdf in graph_data:
+    lr = lodo_cv_within_fold(G, hdf.values, y, drug_ids_arr, disease_ids_arr, f'Graph {gn}')
     lodo_results[gn] = lr
     print(f"  Graph {gn}: AUC={lr['roc_auc'].mean():.3f}+-{lr['roc_auc'].std():.3f} ({len(lr)} diseases)")
     sys.stdout.flush()
@@ -600,15 +651,19 @@ ax.set_ylabel('ROC-AUC'); ax.set_title('Disease-Level CV (LODO)', fontweight='bo
 ax.legend(); ax.set_ylim([0.4, 1.0]); ax.grid(axis='y', alpha=0.3)
 ax.set_xticklabels(graph_labels, rotation=15, ha='right')
 
-# ---- ROC curves ----
+# ---- ROC curves (one additional Node2Vec training per graph for the held-out split) ----
 ax = axes[1, 1]
-for (gn, hdf, edf), col in zip(graph_data, colors_graph):
-    Xc = np.hstack([hdf.values, edf.values])
-    Xtr, Xte, ytr, yte = train_test_split(Xc, y, test_size=0.2, random_state=42, stratify=y)
+for (gn, G, hdf), col in zip(graph_data, colors_graph):
+    Xtr_idx, Xte_idx = train_test_split(np.arange(len(y)), test_size=0.2, random_state=42, stratify=y)
+    model  = train_n2v_fold(G)
+    emb_tr = emb_for_indices(model, drug_ids_arr, disease_ids_arr, Xtr_idx)
+    emb_te = emb_for_indices(model, drug_ids_arr, disease_ids_arr, Xte_idx)
+    Xc_tr  = np.hstack([hdf.values[Xtr_idx], emb_tr])
+    Xc_te  = np.hstack([hdf.values[Xte_idx], emb_te])
     rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-    rf.fit(Xtr, ytr)
-    yp = rf.predict_proba(Xte)[:,1]
-    fpr, tpr, _ = roc_curve(yte, yp)
+    rf.fit(Xc_tr, y[Xtr_idx])
+    yp = rf.predict_proba(Xc_te)[:,1]
+    fpr, tpr, _ = roc_curve(y[Xte_idx], yp)
     label = graph_labels[GRAPH_KEYS.index(gn)]
     ax.plot(fpr, tpr, color=col, lw=2, label=f'{label} (AUC={auc(fpr,tpr):.3f})')
 ax.plot([0,1],[0,1], 'k--', alpha=0.3)
@@ -617,8 +672,8 @@ ax.set_title('ROC Curves - Combined Features', fontweight='bold')
 ax.legend(loc='lower right', fontsize=8); ax.grid(alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('mvp_v3_results.png', dpi=150, bbox_inches='tight')
-print("  Saved: mvp_v3_results.png")
+plt.savefig('results/mvp_v3_results.png', dpi=150, bbox_inches='tight')
+print("  Saved: results/mvp_v3_results.png")
 
 # ============================================================
 # [10/10] Summary → mvp_v3_results.pkl
@@ -634,19 +689,18 @@ print(f"  DISEASES:  {diseases_edges_added:,}")
 print(f"  Reactome:  {reactome_edges_added:,}")
 print(f"  PharmGKB:  {pharmgkb_edges_added:,}")
 
-print(f"\n5-FOLD CV RESULTS:")
+print(f"\n5-FOLD CV RESULTS (within-fold Node2Vec):")
 for idx, row in results_df.iterrows():
     print(f"  {idx:<42} AUC={row['roc_auc_mean']:.3f}+-{row['roc_auc_std']:.3f}")
 
-print(f"\nLODO RESULTS (Combined, 50 diseases):")
+print(f"\nLODO RESULTS (Combined, 50 diseases, within-fold Node2Vec):")
 for g in GRAPH_KEYS:
     if g in lodo_results and len(lodo_results[g]) > 0:
         lr = lodo_results[g]
         print(f"  Graph {g}: AUC={lr['roc_auc'].mean():.3f}+-{lr['roc_auc'].std():.3f}")
 
 best_v3 = results_df.iloc[0]
-print(f"\nBest MVP v2 (reference): Graph B (full PrimeKG) Combined AUC ~known")
-print(f"Best MVP v3: {results_df.index[0]} AUC={best_v3['roc_auc_mean']:.3f}")
+print(f"\nBest MVP v3: {results_df.index[0]} AUC={best_v3['roc_auc_mean']:.3f}")
 
 # Key takeaways
 best_bg = {g: results_df[results_df.index.str.contains(f'Graph {g}')]['roc_auc_mean'].max()
@@ -657,12 +711,12 @@ print(f"  1. Best graph config: Graph {bg} (AUC={best_bg[bg]:.3f})")
 
 for src, gkey, label in [('DISEASES','B','DISEASES'), ('Reactome','C','Reactome'), ('PharmGKB','D','PharmGKB')]:
     diff = best_bg.get(gkey, 0) - best_bg.get('A', 0)
-    if diff > 0.005:   print(f"  2. {label} HELPS: +{diff:.3f} vs baseline A")
+    if diff > 0.005:    print(f"  2. {label} HELPS: +{diff:.3f} vs baseline A")
     elif diff < -0.005: print(f"  2. {label} HURTS: {diff:.3f} vs baseline A")
     else:               print(f"  2. {label} minimal effect: {diff:+.3f} vs baseline A")
 
 combo_diff = best_bg.get('E', 0) - best_bg.get('A', 0)
-if combo_diff > 0.005:   print(f"  3. Combined (E) HELPS: +{combo_diff:.3f} vs baseline A")
+if combo_diff > 0.005:    print(f"  3. Combined (E) HELPS: +{combo_diff:.3f} vs baseline A")
 elif combo_diff < -0.005: print(f"  3. Combined (E) HURTS: {combo_diff:.3f} vs baseline A")
 else:                     print(f"  3. Combined (E) minimal effect: {combo_diff:+.3f} vs baseline A")
 
@@ -672,9 +726,9 @@ print(f"  4. Best method: {bm} (AUC={method_best[bm]:.3f})")
 
 # Save results
 RESULTS['best_v3'] = best_v3['roc_auc_mean']
-with open('mvp_v3_results.pkl', 'wb') as f:
+with open('results/mvp_v3_results.pkl', 'wb') as f:
     pickle.dump(RESULTS, f)
-print("\n  Saved: mvp_v3_results.pkl")
+print("\n  Saved: results/mvp_v3_results.pkl")
 
 print(f"\nTotal runtime: {time.time()-t0:.1f}s")
 print("=" * 70)
