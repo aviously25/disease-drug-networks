@@ -17,3 +17,7 @@ notebook>=7.0.0
 
 # Visualization in notebooks (optional)
 matplotlib>=3.7.0
+
+# GNN experiment
+torch>=2.0.0
+torch-geometric>=2.7.0
