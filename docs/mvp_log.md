@@ -44,3 +44,20 @@ Reactome actually hurts LODO performance (-0.040 vs baseline A), likely because 
 PharmGKB gives the best LODO (+0.007 vs A) and lowest variance (0.288 vs 0.322) – drug-gene pharmacogenomics edges are the most useful augmentation tested
 Combining all three sources (Graph E) doesn't beat PharmGKB alone; more data ≠ better signal when sources overlap or add noise
 High LODO variance (±0.288–0.327) is the central remaining problem – some diseases still completely fail (AUC ~0.0) while others are near-perfect
+
+GNN v1:
+Goals: test whether a heterogeneous GNN learning from typed edge structure outperforms RF + Node2Vec
+Architecture: 2-layer HeteroConv with SAGEConv per edge type (80 edge types incl. reverse), learnable 64-dim node embeddings per type (10 types), MLP link prediction head on [drug_emb || disease_emb]
+Graph: same 1-hop PrimeKG subgraph as v3 Graph A; contraindication/indication/off-label edges fully excluded from message passing
+Evaluation: 5-fold GroupKFold by disease (no disease in both train and test) — same disease-grouped logic as run_evaluation.py but 5 folds rather than LODO-50 because each fold requires a full GNN training run (~2 min/fold on CPU)
+Results:
+  Fold 1: AUC=0.772  Fold 2: AUC=0.782  Fold 3: AUC=0.762  Fold 4: AUC=0.793  Fold 5: AUC=0.818
+  GNN GroupKFold: AUC=0.785 ± 0.019
+  Baseline (v3 LODO RF+N2V): AUC=0.738 ± 0.322
+  Δ AUC: +0.047
+Key findings:
+GNN improves mean AUC by +0.047 over the RF+Node2Vec baseline
+The variance drop (±0.019 vs ±0.322) is the more exciting result – the GNN generalizes much more consistently across disease groups; v3's high variance was likely driven by individual diseases failing completely in LODO, which gets smoothed across ~65 diseases per fold in GroupKFold
+Loss was still declining at epoch 50 (final ~0.52) – more epochs or a scheduler likely improve results further
+320 pairs had missing node mappings (small indexing issue to fix)
+Note on eval comparability: GroupKFold-5 (65 diseases/fold) vs LODO-50 (1 disease/fold) differ in granularity; GNN variance would likely be higher under strict LODO

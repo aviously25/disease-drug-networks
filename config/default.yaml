@@ -1,0 +1,63 @@
+data:
+  primekg_path: data/kg.csv
+  sources:
+    - name: primekg
+      enabled: true
+    - name: pharmgkb
+      enabled: false
+      path: data/pharmgkb_relationships.tsv
+    - name: diseases
+      enabled: false
+      path: data/diseases_knowledge.tsv
+    - name: reactome
+      enabled: false
+      path: data/reactome_ncbi.txt
+  dataset:
+    n_diseases: 328
+    n_drugs: 1000
+    min_balance_ratio: 0.2
+
+models:
+  hetero_gnn:
+    enabled: true
+    emb_dim: 64
+    hidden_dim: 64
+    num_layers: 2
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
+    epochs: 50
+    dropout: 0.3
+
+  dual_encoder:
+    enabled: true
+    emb_dim: 64
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
+    epochs: 50
+    dropout: 0.3
+
+  metapath:
+    enabled: true
+    metapaths:
+      - [drug, gene/protein, disease]
+      - [drug, gene/protein, biological_process, gene/protein, disease]
+    emb_dim: 64
+    hidden_dim: 64
+    num_heads: 4
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
+    epochs: 50
+    dropout: 0.3
+
+evaluation:
+  strategy: group_kfold    # group_kfold | lodo
+  n_splits: 5
+  lodo_n_diseases: 50
+  seed: 42
+  checkpoint_dir: results/checkpoints/
+
+output:
+  results_dir: results/

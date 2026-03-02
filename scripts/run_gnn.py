@@ -6,10 +6,9 @@ Architecture:
   - MLP link prediction head on concatenated drug + disease embeddings
 
 Evaluation (leak-proof):
-  5-fold GroupKFold grouped by disease. No disease appears in both
-  train and test within a fold. Comparable to v3's LODO but 5 folds
-  instead of 50 single-disease splits — necessary because each fold
-  requires training the GNN from scratch.
+  1. 5-fold GroupKFold grouped by disease — fast sanity check (~10 min CPU).
+  2. LODO-50 — 50 sampled diseases each held out individually, GNN retrained
+     from scratch each time. Directly comparable to v3's LODO-50 baseline.
 
 Comparison target: v3 baseline AUC=0.738 ± 0.322 (RF + within-fold Node2Vec, LODO 50 diseases).
 
@@ -135,6 +134,14 @@ for i in range(len(hop1)):
     node_sets[hop1_x_types[i]].add(hop1['x_id'].values[i])
     node_sets[hop1_y_types[i]].add(hop1['y_id'].values[i])
 
+# Fix: explicitly add all dataset drugs/diseases even if they only had
+# target-relation edges (which were stripped), so they appear as zero-degree
+# nodes and still receive a learnable embedding.
+for nid in df_dataset['drug_id'].astype(str).unique():
+    node_sets['drug'].add(nid)
+for nid in df_dataset['disease_id'].astype(str).unique():
+    node_sets['disease'].add(nid)
+
 # Build per-type index mappings (node_id → local int index)
 type_to_id_map = {}
 node_type_sizes = {}
@@ -182,8 +189,16 @@ print(f"  Total edges: {total_edges:,} (incl. reverse)  ({time.time()-t2:.1f}s)"
 # Map dataset drug/disease pairs → local PyG indices
 drug_local = df_dataset['drug_id'].astype(str).map(type_to_id_map['drug']).fillna(-1).astype(int).values
 dis_local  = df_dataset['disease_id'].astype(str).map(type_to_id_map['disease']).fillna(-1).astype(int).values
-n_missing  = (drug_local == -1).sum() + (dis_local == -1).sum()
-print(f"  Pairs with missing node mapping: {n_missing} (should be 0)")
+n_missing = (drug_local == -1).sum() + (dis_local == -1).sum()
+if n_missing > 0:
+    print(f"  WARNING: {n_missing} pairs still have missing node mapping — dropping them.")
+    keep = (drug_local != -1) & (dis_local != -1)
+    df_dataset = df_dataset[keep].reset_index(drop=True)
+    drug_local = drug_local[keep]
+    dis_local  = dis_local[keep]
+    y          = y[keep]
+else:
+    print(f"  All pairs mapped successfully.")
 
 # ============================================================
 # [4/5] GNN Model
@@ -240,26 +255,17 @@ class HeteroGNN(nn.Module):
 
 
 # ============================================================
-# [5/5] 5-Fold GroupKFold (grouped by disease)
+# Training helper (shared by GroupKFold and LODO)
 # ============================================================
-print("\n[5/5] 5-fold GroupKFold evaluation (no disease in both train and test)...")
-print(f"  Baseline: v3 LODO AUC=0.738 ± 0.322 (RF+within-fold Node2Vec)\n")
 
-edge_types = list(data.edge_index_dict.keys())
-groups     = df_dataset['disease_id'].values
-gkf        = GroupKFold(n_splits=5)
-data_dev   = data.to(DEVICE)
-
-fold_results = []
-for fold, (train_idx, test_idx) in enumerate(gkf.split(drug_local, y, groups=groups)):
-    t_fold = time.time()
-    n_test_diseases = len(set(groups[test_idx]))
-    print(f"  Fold {fold+1}/5 | train={len(train_idx):,} pairs | "
-          f"test={len(test_idx):,} pairs across {n_test_diseases} held-out diseases")
-
-    # Build fresh model for each fold
+def train_and_eval(data_dev, train_idx, test_idx, label=''):
+    """Train a fresh GNN on train_idx pairs, evaluate on test_idx pairs.
+    Returns (auc, acc, f1, probs, true_labels).
+    Uses CosineAnnealingLR for better convergence within fixed epoch budget.
+    """
     model     = HeteroGNN(node_type_sizes, edge_types, EMB_DIM, HIDDEN_DIM, DROPOUT).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
     criterion = nn.BCEWithLogitsLoss()
 
     tr_drug = torch.tensor(drug_local[train_idx], dtype=torch.long, device=DEVICE)
@@ -274,63 +280,132 @@ for fold, (train_idx, test_idx) in enumerate(gkf.split(drug_local, y, groups=gro
         loss   = criterion(logits, tr_y)
         loss.backward()
         optimizer.step()
-        if (epoch + 1) % 10 == 0:
-            print(f"    epoch {epoch+1:2d}/{EPOCHS}  loss={loss.item():.4f}", flush=True)
+        scheduler.step()
+        if label and (epoch + 1) % 10 == 0:
+            print(f"    {label} epoch {epoch+1:2d}/{EPOCHS}  loss={loss.item():.4f}  "
+                  f"lr={scheduler.get_last_lr()[0]:.2e}", flush=True)
 
-    # Evaluate on held-out disease pairs
     te_drug = torch.tensor(drug_local[test_idx], dtype=torch.long, device=DEVICE)
     te_dis  = torch.tensor(dis_local[test_idx],  dtype=torch.long, device=DEVICE)
     te_y    = y[test_idx]
 
     model.eval()
     with torch.no_grad():
-        x_dict    = model(data_dev)
-        te_probs  = torch.sigmoid(model.predict_links(x_dict, te_drug, te_dis)).cpu().numpy()
+        x_dict   = model(data_dev)
+        te_probs = torch.sigmoid(model.predict_links(x_dict, te_drug, te_dis)).cpu().numpy()
 
-    auc = roc_auc_score(te_y, te_probs)
+    auc  = roc_auc_score(te_y, te_probs)
     pred = (te_probs >= 0.5).astype(int)
     acc  = accuracy_score(te_y, pred)
     f1   = f1_score(te_y, pred)
+    return auc, acc, f1, te_probs, te_y
 
+
+edge_types = list(data.edge_index_dict.keys())
+groups     = df_dataset['disease_id'].values
+data_dev   = data.to(DEVICE)
+
+# ============================================================
+# [5a/6] 5-Fold GroupKFold (fast sanity check, ~10 min)
+# ============================================================
+print("\n[5a/6] 5-fold GroupKFold (grouped by disease, fast check)...")
+gkf = GroupKFold(n_splits=5)
+
+gkf_results = []
+for fold, (train_idx, test_idx) in enumerate(gkf.split(drug_local, y, groups=groups)):
+    t_fold = time.time()
+    n_held = len(set(groups[test_idx]))
+    print(f"  Fold {fold+1}/5 | train={len(train_idx):,}  test={len(test_idx):,} ({n_held} diseases)")
+    auc, acc, f1, _, _ = train_and_eval(data_dev, train_idx, test_idx,
+                                        label=f'fold{fold+1}')
     elapsed = time.time() - t_fold
-    print(f"  → Fold {fold+1}: AUC={auc:.3f}  Acc={acc:.3f}  F1={f1:.3f}  ({elapsed:.0f}s)\n")
-    fold_results.append({
-        'fold': fold + 1, 'auc': auc, 'acc': acc, 'f1': f1,
-        'n_test': len(test_idx), 'n_test_diseases': n_test_diseases,
-    })
+    print(f"  → AUC={auc:.3f}  Acc={acc:.3f}  F1={f1:.3f}  ({elapsed:.0f}s)\n")
+    gkf_results.append({'fold': fold+1, 'auc': auc, 'acc': acc, 'f1': f1,
+                        'n_test': len(test_idx), 'n_diseases': n_held})
+
+gkf_aucs = [r['auc'] for r in gkf_results]
+print(f"  GroupKFold: AUC={np.mean(gkf_aucs):.3f} ± {np.std(gkf_aucs):.3f}")
 
 # ============================================================
-# Results
+# [5b/6] LODO-50 (apples-to-apples with v3, ~100 min)
 # ============================================================
-print("=" * 60)
-print("RESULTS")
-print("=" * 60)
-aucs = [r['auc'] for r in fold_results]
-accs = [r['acc'] for r in fold_results]
-f1s  = [r['f1']  for r in fold_results]
+print("\n[5b/6] LODO-50 (50 held-out diseases, GNN retrained each split)...")
+print("  Directly comparable to v3 LODO baseline: AUC=0.738 ± 0.322\n")
 
-for r in fold_results:
-    print(f"  Fold {r['fold']}: AUC={r['auc']:.3f}  Acc={r['acc']:.3f}  F1={r['f1']:.3f}")
+CHECKPOINT_PATH = 'results/gnn_lodo_checkpoint.pkl'
 
-print(f"\n  GNN (GroupKFold disease):  AUC={np.mean(aucs):.3f} ± {np.std(aucs):.3f}")
-print(f"  Baseline v3 (LODO RF+N2V): AUC=0.738 ± 0.322")
-print(f"  Δ vs baseline: {np.mean(aucs) - 0.738:+.3f}")
+unique_diseases = sorted(set(groups))
+rng = np.random.RandomState(42)
+lodo_diseases = sorted(rng.choice(unique_diseases, size=min(50, len(unique_diseases)), replace=False))
 
+# Load checkpoint if it exists
+lodo_results = []
+completed_ids = set()
+if os.path.exists(CHECKPOINT_PATH):
+    with open(CHECKPOINT_PATH, 'rb') as f:
+        lodo_results = pickle.load(f)
+    completed_ids = {str(r['disease_id']) for r in lodo_results}
+    print(f"  Resuming from checkpoint: {len(completed_ids)} splits already done.\n")
+
+for i, hd in enumerate(lodo_diseases):
+    if str(hd) in completed_ids:
+        print(f"  [{i+1:2d}/50] disease={hd}  SKIPPED (checkpoint)", flush=True)
+        continue
+
+    t_lodo = time.time()
+    tm     = np.array([d == hd for d in groups])
+    if tm.sum() < 5:
+        continue
+    yt = y[tm]
+    if len(np.unique(yt)) < 2:
+        continue
+
+    train_idx = np.where(~tm)[0]
+    test_idx  = np.where(tm)[0]
+
+    auc, acc, f1, _, _ = train_and_eval(data_dev, train_idx, test_idx)  # silent
+    elapsed = time.time() - t_lodo
+    print(f"  [{i+1:2d}/50] disease={hd}  n_test={tm.sum()}  "
+          f"AUC={auc:.3f}  ({elapsed:.0f}s)", flush=True)
+    result = {'disease_id': str(hd), 'auc': auc, 'acc': acc, 'f1': f1,
+              'n_test': int(tm.sum())}
+    lodo_results.append(result)
+    completed_ids.add(str(hd))
+
+    # Save checkpoint after each split
+    with open(CHECKPOINT_PATH, 'wb') as f:
+        pickle.dump(lodo_results, f)
+
+lodo_aucs = [r['auc'] for r in lodo_results]
+print(f"\n  LODO-50 GNN:              AUC={np.mean(lodo_aucs):.3f} ± {np.std(lodo_aucs):.3f}")
+print(f"  LODO-50 baseline (RF+N2V): AUC=0.738 ± 0.322")
+print(f"  Δ vs baseline: {np.mean(lodo_aucs) - 0.738:+.3f}")
+
+# ============================================================
+# [6/6] Save results
+# ============================================================
+print("\n[6/6] Saving results...")
 results = {
-    'fold_results':  fold_results,
-    'mean_auc': np.mean(aucs), 'std_auc': np.std(aucs),
-    'mean_acc': np.mean(accs), 'std_acc': np.std(accs),
-    'mean_f1':  np.mean(f1s),  'std_f1':  np.std(f1s),
+    'groupkfold': {
+        'fold_results': gkf_results,
+        'mean_auc': np.mean(gkf_aucs), 'std_auc': np.std(gkf_aucs),
+    },
+    'lodo': {
+        'disease_results': lodo_results,
+        'mean_auc': np.mean(lodo_aucs), 'std_auc': np.std(lodo_aucs),
+        'mean_acc': np.mean([r['acc'] for r in lodo_results]),
+        'mean_f1':  np.mean([r['f1']  for r in lodo_results]),
+    },
     'model_config': {
         'emb_dim': EMB_DIM, 'hidden_dim': HIDDEN_DIM,
         'num_layers': NUM_LAYERS, 'lr': LR, 'epochs': EPOCHS,
-        'dropout': DROPOUT,
+        'dropout': DROPOUT, 'scheduler': 'CosineAnnealingLR',
     },
 }
 with open('results/gnn_results.pkl', 'wb') as f:
     pickle.dump(results, f)
 
-print(f"\n  Saved: results/gnn_results.pkl")
+print(f"  Saved: results/gnn_results.pkl")
 print(f"  Total runtime: {(time.time()-t0)/60:.1f} min")
 print("=" * 60)
 print("DONE")
