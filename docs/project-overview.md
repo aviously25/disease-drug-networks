@@ -61,7 +61,8 @@ A series of MVPs was run to validate whether the research question was tractable
 The MVP progression confirmed that the problem is real and tractable, and produced two specific refinements to the research question:
 
 **Confirmed research question:**
-> Can a heterogeneous GNN trained on a biologically enriched knowledge graph predict whether a drug is contraindicated for a patient with a given disease, generalizing to unseen diseases?
+> Can graph-based models learn to predict adverse drug outcomes from the structure of a biomedical knowledge graph, and does explicitly
+  modeling biological pathway interactions between drug and disease improve generalization to unseen diseases?
 
 **The disease-only vs. genetic-information question:**
 
